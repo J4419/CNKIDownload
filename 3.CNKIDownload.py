@@ -286,7 +286,8 @@ def collect_downloads(items, downloads_dir, out_dir, cfg) -> dict:
             continue
         base = os.path.basename(fp)
 
-        candidates = filename_matches(os.path.splitext(base)[0], items)
+        candidates = filename_matches(os.path.splitext(base)[0], items,
+                                      getattr(cfg, "download_authors", None))
         hit = candidates[0] if len(candidates) == 1 else None
         if not hit:
             if candidates:
@@ -351,7 +352,8 @@ def scan_progress(items, out_dir, downloads_dir, cfg) -> dict:
     for fp in list_pdfs(downloads_dir):
         if not valid_pdf(fp, cfg.min_kb):
             continue
-        hit = match_list_by_filename(os.path.splitext(os.path.basename(fp))[0], items)
+        hit = match_list_by_filename(os.path.splitext(os.path.basename(fp))[0], items,
+                                    verified_authors=getattr(cfg, "download_authors", None))
         if hit:
             done.add(hit["no"])
 
@@ -430,6 +432,19 @@ def validated_url_cache(cache, items) -> dict:
                 and select_detail_link([candidate], item) is not None
                 and normalize_key(entry.get("hit")) == normalize_key(item.get("title"))):
             result[key] = entry
+    return result
+
+
+def download_authors_from_cache(cache, items) -> dict:
+    """补充下载匹配信息，不修改用户清单及其题录标识。"""
+    valid = validated_url_cache(cache, items)
+    result = {}
+    for item in items:
+        entry = valid.get(str(item["no"]))
+        if entry and not author_keys(item.get("author")):
+            authors = entry["candidate"].get("author")
+            if author_keys(authors):
+                result[item_identity(item)] = authors
     return result
 
 
@@ -698,6 +713,7 @@ def main(argv: list[str]) -> int:
 
     raw_cache = read_json(url_cache_file, {})
     url_cache = {} if cfg.force else validated_url_cache(raw_cache, items)
+    cfg.download_authors = download_authors_from_cache(url_cache, items)
     if raw_cache != url_cache:
         write_json(url_cache_file, url_cache)
         print("旧版、题录变化或未通过核验的 URL 缓存已失效，将重新搜索；PDF 不会因此被删除。")
@@ -913,6 +929,29 @@ def main(argv: list[str]) -> int:
             print("-" * 64)
     else:
         print("\n详情页 URL 已全部缓存，跳过搜索。")
+
+    # 本轮新取得作者信息后，立即归集已有下载，避免再等一次或重复开页。
+    refreshed_authors = download_authors_from_cache(url_cache, items)
+    if refreshed_authors != cfg.download_authors:
+        cfg.download_authors = refreshed_authors
+        refreshed = collect_downloads(items, downloads_dir, cfg.out, cfg)
+        if refreshed["renamed"]:
+            print(f"\n使用新核验的作者信息归集 {len(refreshed['renamed'])} 个文件：")
+            for name in refreshed["renamed"]:
+                print(f"   + {name}")
+        for error in refreshed["errors"]:
+            print(f"[!] 归集失败：{error}")
+        progress = scan_progress(items, cfg.out, downloads_dir, cfg)
+        done_set = set(progress["done"])
+        remaining = [x for x in items if x["no"] not in done_set]
+        auto_remaining = [x for x in remaining if str(x["no"]) not in manual_set]
+        write_json(state_file, progress["done"])
+        print(f"进度更新：已完成 {len(progress['done'])} / {len(items)}　剩余 {len(remaining)}")
+        if not auto_remaining:
+            print_remaining(remaining, manual_set, url_cache, failed)
+            if not remaining:
+                print("全部完成。")
+            return finish(0)
 
     # ---- 5. 开本批标签页 ----
     batch = [x for x in auto_remaining if str(x["no"]) in url_cache][: cfg.batch_size]

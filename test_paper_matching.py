@@ -39,6 +39,19 @@ class FakeTab:
     def js(self, *args, **kwargs): return json.dumps(self.rows, ensure_ascii=False)
 
 class FilenameTests(unittest.TestCase):
+    def test_cnki_middle_ellipsis_matches_with_known_author(self):
+        title='瑞马唑仑通过SIRT1/PINK1/Parkin通路调控线粒体自噬抑制OGD/R诱导的HT22神经细胞损伤'
+        stem='瑞马唑仑通过SIRT1_PINK1_Parkin通路...控线粒体自噬抑制OGD_R诱导的HT22神经细胞损伤_魏稼黎'
+        match=cdp.match_list_by_filename(stem,[item(title=title,author='魏稼黎')])
+        self.assertIsNotNone(match)
+        self.assertEqual(match['no'],1)
+    def test_middle_ellipsis_with_shared_ends_remains_ambiguous(self):
+        prefix,suffix='城市轨道交通短期客流预测模型','应用与实验评价方法研究'
+        items=[item(title=prefix+'甲模型'+suffix),item(2,title=prefix+'乙模型'+suffix)]
+        self.assertIsNone(cdp.match_list_by_filename(prefix+'...'+suffix+'_张三',items))
+    def test_middle_ellipsis_requires_substantial_both_ends(self):
+        for stem in [TITLE_A[:5]+'...'+TITLE_A[-8:]+'_张三', TITLE_A[:12]+'..._张三']:
+            self.assertIsNone(cdp.match_list_by_filename(stem,[item()]))
     def test_distinct_titles_with_same_first_ten_characters(self):
         items=[item(), item(2,TITLE_B)]
         self.assertEqual(cdp.match_list_by_filename(TITLE_B+'_张三',items)['no'],2)
@@ -159,6 +172,78 @@ class FilesystemTests(unittest.TestCase):
         main.collect_downloads([item(),item(2,TITLE_B)],str(self.dl),str(self.out),self.cfg)
         self.assertFalse(source.exists())
         self.assertTrue((self.out/('2_'+TITLE_B+'.pdf')).exists())
+    def cache_for(self,target,author='张三'):
+        return {str(target['no']):{'href':URL_A,'title':target['title'],'hit':target['title'],
+            'matchVersion':cdp.MATCH_VERSION,'identity':cdp.item_identity(target),
+            'candidate':link(title=target['title'],author=author)}}
+    def test_title_only_list_uses_verified_search_author_then_moves_on_rerun(self):
+        target=item(author='',year='')
+        self.write('cnki_list.json',[target])
+        self.write('cnki_detail_urls.json',self.cache_for(target))
+        source=self.pdf(self.dl,TITLE_A+'_张三.pdf')
+        rc,_=self.run_main(['--collect'])
+        self.assertEqual(rc,0)
+        self.assertFalse(source.exists())
+        self.assertTrue((self.out/('1_'+TITLE_A+'.pdf')).exists())
+        cfg=json.loads((self.state/'cnki_config.json').read_text(encoding='utf-8'))
+        self.assertEqual(cfg['verifiedFiles']['1_'+TITLE_A+'.pdf']['identity'],cdp.item_identity(target))
+        rc,_=self.run_main(['--status'])
+        self.assertEqual(rc,0)
+        self.assertEqual(json.loads((self.state/'cnki_dl_state.json').read_text()),[1])
+    def test_title_only_list_collects_cnki_middle_ellipsis_using_verified_author(self):
+        title='瑞马唑仑通过SIRT1/PINK1/Parkin通路调控线粒体自噬抑制OGD/R诱导的HT22神经细胞损伤'
+        target=item(title=title,author='',year='')
+        self.write('cnki_list.json',[target])
+        self.write('cnki_detail_urls.json',self.cache_for(target,'魏稼黎'))
+        source=self.pdf(self.dl,'瑞马唑仑通过SIRT1_PINK1_Parkin通路...控线粒体自噬抑制OGD_R诱导的HT22神经细胞损伤_魏稼黎.pdf')
+        rc,_=self.run_main(['--collect'])
+        self.assertEqual(rc,0)
+        self.assertFalse(source.exists())
+        self.assertEqual(len(list(self.out.glob('*.pdf'))),1)
+    def test_fresh_search_author_collects_existing_download_in_same_run(self):
+        target=item(author='',year='')
+        self.write('cnki_list.json',[target])
+        source=self.pdf(self.dl,TITLE_A+'_张三.pdf')
+        rc,_=self.run_main(['--no-launch'],[link(author='张三')])
+        self.assertEqual(rc,0)
+        self.assertFalse(source.exists())
+        self.assertEqual(len(list(self.out.glob('*.pdf'))),1)
+        self.assertEqual(json.loads((self.state/'cnki_dl_state.json').read_text()),[1])
+    def test_stale_cache_cannot_supply_missing_author(self):
+        target=item(author='')
+        self.write('cnki_list.json',[target])
+        stale=self.cache_for(target)
+        stale['1']['identity']='stale'
+        self.write('cnki_detail_urls.json',stale)
+        source=self.pdf(self.dl,TITLE_A+'_张三.pdf')
+        rc,_=self.run_main(['--collect'])
+        self.assertEqual(rc,0)
+        self.assertTrue(source.exists())
+    def test_verified_search_author_cannot_override_supplied_conflicting_author(self):
+        target=item(author='李四')
+        self.write('cnki_list.json',[target])
+        self.write('cnki_detail_urls.json',self.cache_for(target,'张三'))
+        source=self.pdf(self.dl,TITLE_A+'_张三.pdf')
+        rc,_=self.run_main(['--collect'])
+        self.assertEqual(rc,0)
+        self.assertTrue(source.exists())
+    def test_verified_author_keeps_same_title_list_entries_ambiguous(self):
+        first,second=item(author='',year=''),item(2,author='',year='')
+        self.write('cnki_list.json',[first,second])
+        self.write('cnki_detail_urls.json',{**self.cache_for(first),**self.cache_for(second)})
+        source=self.pdf(self.dl,TITLE_A+'_张三.pdf')
+        rc,_=self.run_main(['--collect'])
+        self.assertEqual(rc,0)
+        self.assertTrue(source.exists())
+    def test_unknown_author_same_title_year_variant_blocks_cached_candidate(self):
+        first,second=item(author='',year='2023'),item(2,author='',year='2024')
+        self.write('cnki_list.json',[first,second])
+        self.write('cnki_detail_urls.json',self.cache_for(first))
+        source=self.pdf(self.dl,TITLE_A+'_张三.pdf')
+        rc,_=self.run_main(['--collect'])
+        self.assertEqual(rc,0)
+        self.assertTrue(source.exists())
+        self.assertEqual(list(self.out.glob('*.pdf')),[])
     def test_long_title_remains_complete_in_verified_file_record(self):
         target=item(title=TITLE_A+'完整长标题后半部分不可混淆')
         self.pdf(self.dl,target['title']+'_张三.pdf')

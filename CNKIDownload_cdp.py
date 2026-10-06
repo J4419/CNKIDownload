@@ -614,35 +614,58 @@ def file_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
-def filename_matches(file_base: str, items: list[dict]) -> list[dict]:
-    """只接受完整标题或完整标题加已知作者；返回全部候选以便拒绝歧义。"""
+def download_title_matches(prefix: str, title_key: str) -> bool:
+    """支持知网用省略号缩短文件名，但必须保留足够长的两端。"""
+    if normalize_key(prefix) == title_key:
+        return True
+    parts = _re.split(r"\.{3,}|…+", prefix)
+    if len(parts) != 2:
+        return False
+    left, right = map(normalize_key, parts)
+    return (len(left) >= 12 and len(right) >= 8
+            and len(title_key) > len(left) + len(right)
+            and title_key.startswith(left) and title_key.endswith(right))
+
+
+def filename_matches(file_base: str, items: list[dict], verified_authors=None) -> list[dict]:
+    """按标题和已知作者匹配；作者可来自绑定当前题录的已核验搜索缓存。"""
     original = str(file_base or "").strip()
     # 只在已知作者后缀后处理浏览器的 " (1)" 序号，不能删掉标题中的年份。
     stems = {original, _re.sub(r" \([1-9]\d*\)$", "", original)}
     matches = []
+    unknown_author_candidates = []
     for item in items:
         t = normalize_key(item.get("title", ""))
         if not t:
             continue
         authors = author_keys(item.get("author"))
+        if not authors and isinstance(verified_authors, dict):
+            authors = author_keys(verified_authors.get(item_identity(item)))
         matched = normalize_key(original) == t
-        if not matched and authors:
+        possible_unknown = False
+        if not matched:
             for stem in stems:
                 for split in (m.start() for m in _re.finditer("_", stem)):
                     prefix, suffix = stem[:split], stem[split + 1:]
                     suffix_authors = author_keys(suffix)
-                    if (normalize_key(prefix) == t and suffix_authors
+                    if not authors and download_title_matches(prefix, t) and suffix_authors:
+                        possible_unknown = True
+                    if (download_title_matches(prefix, t) and suffix_authors
+                            and authors
                             and suffix_authors[0] == authors[0]
                             and all(a in authors for a in suffix_authors)):
                         matched = True
         if matched:
             matches.append(item)
-    return matches
+        elif possible_unknown:
+            unknown_author_candidates.append(item)
+    # 同标题的未知作者也可能是该文件，不能因另一条有缓存就忽略它。
+    return matches + unknown_author_candidates if matches else []
 
 
-def match_list_by_filename(file_base: str, items: list[dict], head_len=None):
+def match_list_by_filename(file_base: str, items: list[dict], head_len=None, *, verified_authors=None):
     """兼容旧参数，但不再使用前缀长度；必须且只能命中一篇文献。"""
-    matches = filename_matches(file_base, items)
+    matches = filename_matches(file_base, items, verified_authors)
     return matches[0] if len(matches) == 1 else None
 
 
